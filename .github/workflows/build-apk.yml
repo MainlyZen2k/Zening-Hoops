@@ -1,3 +1,4 @@
+
 on:
   push:
     branches: [main, master]
@@ -92,8 +93,8 @@ jobs:
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           for pkg in "cmdline-tools;latest" "platform-tools" \
-                     "platforms;android-35" "platforms;android-36" "platforms;android-37" \
-                     "build-tools;35.0.0" "build-tools;36.0.0" "build-tools;37.0.0"; do
+                     "platforms;android-35" "platforms;android-36" \
+                     "build-tools;35.0.0" "build-tools;36.0.0"; do
             sdkmanager --install "$pkg" > /dev/null 2>&1 || echo "skip: $pkg not available yet"
           done
           sdkmanager --list_installed || true
@@ -109,7 +110,7 @@ jobs:
           set -e
           if [ ! -f package.json ]; then npm init -y > /dev/null; fi
           npm install --no-audit --no-fund
-          # Always pull the newest Capacitor 8.x so the native template is current
+          # Always pull the newest Capacitor so the native template is current
           npm install --no-audit --no-fund \
             @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
           cat > capacitor.config.json <<JSON
