@@ -1,0 +1,209 @@
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # You push the zip straight into the repo, so make sure unzip exists
+      - name: Install unzip
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip zip
+
+      - name: Unzip the game archive
+        id: unpack
+        run: |
+          set -e
+          ZIP_FILE="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found archive: $ZIP_FILE"
+            rm -rf extracted
+            unzip -o -q "$ZIP_FILE" -d extracted
+            COUNT="$(ls -1A extracted | wc -l | tr -d ' ')"
+            TOP="$(ls -1A extracted | head -n 1)"
+            if [ "$COUNT" = "1" ] && [ -d "extracted/$TOP" ]; then
+              echo "project_dir=extracted/$TOP" >> "$GITHUB_OUTPUT"
+            else
+              echo "project_dir=extracted" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No zip in repo root - assuming the project files are committed directly"
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Locate the web assets (index.html)
+        id: locate
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          set -e
+          INDEX="$(find . -maxdepth 3 -name index.html -not -path '*/node_modules/*' -not -path '*/android/*' -not -path '*/www/*' | head -n 1)"
+          if [ -z "$INDEX" ]; then
+            echo "::error::index.html was not found in the extracted project"
+            exit 1
+          fi
+          WEB_DIR="$(dirname "$INDEX")"
+          WEB_DIR="${WEB_DIR#./}"
+          if [ "$WEB_DIR" = "." ]; then
+            # Game files sit at the project root: gather them into www/ so the
+            # APK never bundles node_modules or build scripts
+            mkdir -p www
+            for item in index.html css js manifest.json icons assets; do
+              if [ -e "$item" ]; then cp -r "$item" www/; fi
+            done
+            WEB_DIR="www"
+          fi
+          echo "web_dir=$WEB_DIR" >> "$GITHUB_OUTPUT"
+          echo "webDir: $WEB_DIR"
+
+      - name: Set up Node.js 24 (latest LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # This is the fix for the old "SDK" errors: a fresh command-line tools
+      # install, every license accepted up front, and the platforms/build-tools
+      # the build needs explicitly installed before Gradle runs.
+      - name: Set up latest Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Accept licenses and install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          for pkg in "cmdline-tools;latest" "platform-tools" \
+                     "platforms;android-35" "platforms;android-36" "platforms;android-37" \
+                     "build-tools;35.0.0" "build-tools;36.0.0" "build-tools;37.0.0"; do
+            sdkmanager --install "$pkg" > /dev/null 2>&1 || echo "skip: $pkg not available yet"
+          done
+          sdkmanager --list_installed || true
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install latest Capacitor and prepare the project
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        env:
+          WEB_DIR: ${{ steps.locate.outputs.web_dir }}
+        run: |
+          set -e
+          if [ ! -f package.json ]; then npm init -y > /dev/null; fi
+          npm install --no-audit --no-fund
+          # Always pull the newest Capacitor 8.x so the native template is current
+          npm install --no-audit --no-fund \
+            @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+          cat > capacitor.config.json <<JSON
+          {
+            "appId": "com.zening.hoops",
+            "appName": "Zening Hoops",
+            "webDir": "$WEB_DIR",
+            "android": { "allowMixedContent": false }
+          }
+          JSON
+          cat capacitor.config.json
+
+      - name: Generate Android project and sync web assets
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          set -e
+          if [ -f scripts/prepare-www.js ]; then node scripts/prepare-www.js; fi
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      # The game is landscape-only: lock the native app to sensorLandscape
+      - name: Force landscape orientation in the Android manifest
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if 'screenOrientation' not in s and 'android:name=".MainActivity"' in s:
+              s = s.replace(
+                  'android:name=".MainActivity"',
+                  'android:name=".MainActivity"\n            android:screenOrientation="sensorLandscape"'
+              )
+              open(p, 'w', encoding='utf-8').write(s)
+              print('manifest patched: sensorLandscape')
+          else:
+              print('orientation already set or MainActivity tag not found')
+          PY
+
+      - name: Build debug and release APKs
+        working-directory: ${{ steps.unpack.outputs.project_dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug assembleRelease
+
+      - name: Collect and rename APKs
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          mkdir -p apk-out
+          find android/app/build/outputs/apk -name '*.apk' -exec cp {} apk-out/ \;
+          [ -f apk-out/app-debug.apk ] && mv apk-out/app-debug.apk apk-out/ZeningHoops-debug.apk || true
+          [ -f apk-out/app-release-unsigned.apk ] && mv apk-out/app-release-unsigned.apk apk-out/ZeningHoops-release-unsigned.apk || true
+          ls -la apk-out
+
+      # Optional: add repo secrets ANDROID_KEYSTORE_BASE64 (base64 of your .jks),
+      # ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_ALIAS_PASSWORD
+      # and this step signs the release APK automatically. Skipped otherwise.
+      - name: Sign release APK (only if keystore secrets exist)
+        if: env.HAS_KEYSTORE == 'true'
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
+        run: |
+          set -e
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          "$BT/zipalign" -f 4 apk-out/ZeningHoops-release-unsigned.apk apk-out/ZeningHoops-aligned.apk
+          "$BT/apksigner" sign --ks keystore.jks --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$ANDROID_KEY_ALIAS_PASSWORD" \
+            --out apk-out/ZeningHoops-release-signed.apk apk-out/ZeningHoops-aligned.apk
+          rm -f keystore.jks apk-out/ZeningHoops-aligned.apk
+          ls -la apk-out
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ZeningHoops-APK
+          path: ${{ steps.unpack.outputs.project_dir }}/apk-out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # Push a tag like v1.0 and the APKs are attached to a GitHub Release too
+      - name: Attach APKs to a GitHub Release (on tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          gh release view "$VERSION" > /dev/null 2>&1 || \
+            gh release create "$VERSION" --title "Zening Hoops $VERSION" --notes "APK build"
+          gh release upload "$VERSION" apk-out/*.apk --clobber
